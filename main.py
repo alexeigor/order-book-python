@@ -4,9 +4,10 @@ import aiofiles
 import logging
 import random
 import argparse
-import datetime
-import json
+import time
+import os
 from functools import partial
+from itertools import islice
 
 import uvloop
 
@@ -17,20 +18,33 @@ from pyinstrument import Profiler
 from picows import ws_connect, WSFrame, WSTransport, WSListener, WSMsgType
 
 from beartype import beartype
-from beartype.typing import List, Dict, Deque, Tuple, Optional, Any
-
-from aiokafka import AIOKafkaProducer
+from beartype.typing import List, Dict, Deque, Tuple, Optional, Any, Callable, NamedTuple
 
 logging.basicConfig(level=logging.DEBUG)
 log = logging.getLogger(__name__)
 
 
+# Identifier for Binance USD-M futures, matching Tardis' exchange id.
+EXCHANGE = "binance-futures"
+# Number of price levels per side captured in each book_snapshot_5 row.
+SNAPSHOT_DEPTH = 5
+
+# A single price level as the exchange's original (price, qty) decimal strings.
+Level = Tuple[str, str]
+
 
 @beartype
 class OrderBook:
+    """
+    A faithful local copy of one symbol's order book, assembled from a REST
+    snapshot plus incremental diffs. The full depth is retained; the top-N is
+    extracted only at read time. Levels are stored as the exchange's original
+    decimal strings (keyed by float price purely for ordering) so emitted
+    snapshots preserve exact values without float round-trip artifacts.
+    """
     def __init__(self) -> None:
-        self.bids: SortedDict[float, float] = SortedDict(lambda x: -x)
-        self.asks: SortedDict[float, float] = SortedDict()
+        self.bids: SortedDict[float, Level] = SortedDict(lambda x: -x)
+        self.asks: SortedDict[float, Level] = SortedDict()
         self.last_update_id: Optional[int] = None
 
     def clear(self) -> None:
@@ -44,47 +58,43 @@ class OrderBook:
         self.asks.clear()
 
         for price, qty in snapshot["bids"]:
-            self.bids[float(price)] = float(qty)
+            self.bids[float(price)] = (price, qty)
         for price, qty in snapshot["asks"]:
-            self.asks[float(price)] = float(qty)
-
-        assert self.bids.keys()[0] < self.asks.keys()[0], "assert: Incorrect ordering of bids and asks"
-
-        self.trim()
+            self.asks[float(price)] = (price, qty)
 
     def apply_diff(self, bids: List[List[str]], asks: List[List[str]]) -> None:
-        assert self.bids.keys()[0] < self.asks.keys()[0], "assert: Incorrect ordering of bids and asks"
         for price, qty in bids:
             p = float(price)
-            q = float(qty)
-            if q == 0:
+            if float(qty) == 0:
                 self.bids.pop(p, None)
             else:
-                self.bids[p] = q
+                self.bids[p] = (price, qty)
 
         for price, qty in asks:
             p = float(price)
-            q = float(qty)
-            if q == 0:
+            if float(qty) == 0:
                 self.asks.pop(p, None)
             else:
-                self.asks[p] = q
+                self.asks[p] = (price, qty)
 
-        assert self.bids.keys()[0] < self.asks.keys()[0], "assert: Incorrect ordering of bids and asks"
+    def top_levels(self, depth: int = SNAPSHOT_DEPTH) -> Tuple[List[Level], List[Level]]:
+        # islice keeps this O(depth) even when the full book holds thousands of levels.
+        bid_levels: List[Level] = list(islice(self.bids.values(), depth))
+        ask_levels: List[Level] = list(islice(self.asks.values(), depth))
 
-        # self.trim()
+        # Defensive crossed-level removal (Tardis-faithful, read-path only): drop
+        # any level that crosses the opposite best. Crossing is rare/transient and
+        # self-heals on the next diff, so we never mutate the stored book here.
+        if bid_levels and ask_levels:
+            best_bid = float(bid_levels[0][0])
+            best_ask = float(ask_levels[0][0])
+            if best_bid >= best_ask:
+                ask_levels = [lvl for lvl in ask_levels if float(lvl[0]) > best_bid]
+                bid_levels = [lvl for lvl in bid_levels if float(lvl[0]) < best_ask]
 
-    def trim(self) -> None:
-        while len(self.bids) > 5:
-            self.bids.popitem()
-        while len(self.asks) > 5:
-            self.asks.popitem()
+        return bid_levels[:depth], ask_levels[:depth]
 
-    def top_levels(self) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
-        bid_levels = list(self.bids.items())[:2]
-        ask_levels = list(self.asks.items())[:2]
-        return bid_levels, ask_levels
-    
+
 @beartype
 class OrderBookCollection:
     """
@@ -118,65 +128,135 @@ class OrderBookCollection:
         book = self.get_book(symbol)
         return book.last_update_id if book else None
 
-    def get_top_levels(self, symbol: str) -> Optional[Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]]:
+    def get_top_levels(self, symbol: str, depth: int = SNAPSHOT_DEPTH) -> Optional[Tuple[List[Level], List[Level]]]:
         book = self.get_book(symbol)
-        return book.top_levels() if book else None
+        return book.top_levels(depth) if book else None
+
+
+# Fixed preamble shared by every Tardis data type's CSV.
+PREAMBLE = ["exchange", "symbol", "timestamp", "local_timestamp"]
+
+# Tardis `quotes` schema: top-of-book only, with the (asymmetric) column order
+# ask_amount, ask_price, bid_price, bid_amount.
+QUOTES_HEADER = ",".join(PREAMBLE + ["ask_amount", "ask_price", "bid_price", "bid_amount"])
 
 
 @beartype
-class Scheduler:
-    def __init__(self, interval_minutes: int):
-        self.interval_minutes = interval_minutes
-        self.subscribers = []
+def build_snapshot_header(depth: int) -> str:
+    """Tardis-style book_snapshot_<depth> header: preamble + per-level columns."""
+    return ",".join(
+        PREAMBLE
+        + [
+            f"{side}[{i}].{field}"
+            for i in range(depth)
+            for side, field in (("asks", "price"), ("asks", "amount"), ("bids", "price"), ("bids", "amount"))
+        ]
+    )
 
-    def subscribe(self, callback):
-        self.subscribers.append(callback)
 
-    async def start(self):
+# Back-compat alias for the book_snapshot_5 header.
+SNAPSHOT_HEADER = build_snapshot_header(SNAPSHOT_DEPTH)
+
+
+@beartype
+def build_snapshot_row(
+    symbol: str,
+    ts_us: int,
+    local_us: int,
+    asks: List[Level],
+    bids: List[Level],
+    depth: int = SNAPSHOT_DEPTH,
+) -> str:
+    """Build one Tardis-format book_snapshot_<depth> CSV line, padding missing levels."""
+    fields: List[str] = [EXCHANGE, symbol.lower(), str(ts_us), str(local_us)]
+    for i in range(depth):
+        ask = asks[i] if i < len(asks) else ("", "")
+        bid = bids[i] if i < len(bids) else ("", "")
+        fields.extend((ask[0], ask[1], bid[0], bid[1]))
+    return ",".join(fields)
+
+
+@beartype
+def build_quotes_row(
+    symbol: str,
+    ts_us: int,
+    local_us: int,
+    asks: List[Level],
+    bids: List[Level],
+) -> str:
+    """Build one Tardis-format `quotes` CSV line (top of book only)."""
+    ask = asks[0] if asks else ("", "")
+    bid = bids[0] if bids else ("", "")
+    # Level == (price, qty); quotes column order is ask_amount, ask_price, bid_price, bid_amount.
+    fields: List[str] = [EXCHANGE, symbol.lower(), str(ts_us), str(local_us)]
+    fields.extend((ask[1], ask[0], bid[0], bid[1]))
+    return ",".join(fields)
+
+
+@beartype
+def dedup_key(asks: List[Level], bids: List[Level]) -> Tuple:
+    """Hashable key for change-detection: the tracked levels of both sides."""
+    return (tuple(asks), tuple(bids))
+
+
+class DataTypeSpec(NamedTuple):
+    name: str
+    depth: int
+    header: str
+    row_builder: Callable[..., str]
+
+
+# Registry of supported Tardis data types. All reconstruct from the same full
+# order book; they differ only in depth and CSV schema.
+DATA_TYPES: Dict[str, DataTypeSpec] = {
+    "quotes": DataTypeSpec("quotes", 1, QUOTES_HEADER, build_quotes_row),
+    "book_snapshot_5": DataTypeSpec(
+        "book_snapshot_5", 5, build_snapshot_header(5), partial(build_snapshot_row, depth=5)
+    ),
+    "book_snapshot_25": DataTypeSpec(
+        "book_snapshot_25", 25, build_snapshot_header(25), partial(build_snapshot_row, depth=25)
+    ),
+}
+
+
+@beartype
+async def snapshot_writer(queue: asyncio.Queue, path: str, header: str) -> None:
+    """Single long-lived task that owns one output file and appends its rows."""
+    write_header = not os.path.exists(path) or os.path.getsize(path) == 0
+    async with aiofiles.open(path, mode="a", encoding="utf-8") as f:
+        if write_header:
+            await f.write(header + "\n")
+            await f.flush()
+        log.info(f"Snapshot writer started, appending to: {path}")
         while True:
-            now = datetime.datetime.utcnow()
-            next_time = now + datetime.timedelta(seconds=(self.interval_minutes * 60 + 5))
-            next_time = next_time.replace(second=0, microsecond=0)
-            sleep_duration = (next_time - now).total_seconds()
-            log.info(f"Scheduled next event in {sleep_duration:.1f} second(s)...")
-            await asyncio.sleep(sleep_duration)
-
-            timestamp = datetime.datetime.utcnow().isoformat()
-            for callback in self.subscribers:
-                asyncio.create_task(callback(timestamp))
-
-@beartype
-class BaseCalculation:
-    def __init__(self, symbol: str, order_book_collection: OrderBookCollection,):
-        self.symbol = symbol
-        self.order_book_collection = order_book_collection
-
-    def calc_metric(self) -> Optional[float]:
-        raise NotImplementedError
-
-@beartype    
-class SecondLevelSpreadCalculator(BaseCalculation):
-    def calc_metric(self) -> Optional[float]:
-        if self.order_book_collection.get_last_update_id(symbol=self.symbol) is None:
-            return None
-        bids, asks = self.order_book_collection.get_top_levels(symbol=self.symbol)
-        if len(bids) >= 2 and len(asks) >= 2:
-            second_bid = bids[1][0]
-            second_ask = asks[1][0]
-            assert second_bid < second_ask, "assert: Incorrect ordering of bids and asks"
-            spread = (second_ask - second_bid) / (second_ask + second_bid) * 0.5
-            assert spread >= 0, "assert: Invalid spread value"
-            return spread
-        return None
-    
+            row = await queue.get()
+            # Drain any rows that have piled up so we batch the flush.
+            await f.write(row + "\n")
+            try:
+                while True:
+                    await f.write(queue.get_nowait() + "\n")
+            except asyncio.QueueEmpty:
+                pass
+            await f.flush()
 
 
 @beartype
 class BinanceStreamListener(WSListener):
-    def __init__(self, symbols: List[str], order_book_collection: OrderBookCollection, simulate_desync_flag: bool = False) -> None:
+    def __init__(
+        self,
+        symbols: List[str],
+        order_book_collection: OrderBookCollection,
+        snapshot_queues: Dict[str, asyncio.Queue],
+        data_type_specs: List[DataTypeSpec],
+        simulate_desync_flag: bool = False,
+    ) -> None:
         super().__init__()
         self.symbols: List[str] = [s.upper() for s in symbols]
         self.order_books_collection = order_book_collection
+        self.snapshot_queues = snapshot_queues
+        self.data_type_specs = data_type_specs
+        # Extract the book once at the deepest configured depth; each type slices a prefix.
+        self.max_depth: int = max(spec.depth for spec in data_type_specs)
         self.buffers: Dict[str, Deque[Dict[str, Any]]] = defaultdict(deque)
         self.snapshot_received: Dict[str, bool] = {
             symbol: False for symbol in self.symbols
@@ -185,6 +265,8 @@ class BinanceStreamListener(WSListener):
             symbol: False for symbol in self.symbols
         }
         self.prev_u: Dict[str, int] = {}
+        # Last emitted levels key per (data_type, symbol), for on-change dedup.
+        self.last_emitted: Dict[Tuple[str, str], Tuple] = {}
         self.max_buffer_size: int = 1000
         self.json_parser = Parser()
         self.simulate_desync_flag: bool = simulate_desync_flag
@@ -261,9 +343,32 @@ class BinanceStreamListener(WSListener):
         await asyncio.sleep(delay)
         await self.fetch_snapshot(symbol)
 
+    def emit_snapshot(self, symbol: str, event_time_ms: int, local_us: int) -> None:
+        """Emit a row for each configured data type, but only when its levels change."""
+        top = self.order_books_collection.get_top_levels(symbol, self.max_depth)
+        if top is None:
+            return
+        bids, asks = top
+        ts_us = event_time_ms * 1000
+        for spec in self.data_type_specs:
+            a = asks[: spec.depth]
+            b = bids[: spec.depth]
+            key = dedup_key(a, b)
+            dkey = (spec.name, symbol)
+            if key == self.last_emitted.get(dkey):
+                continue
+            self.last_emitted[dkey] = key
+            row = spec.row_builder(symbol, ts_us, local_us, a, b)
+            try:
+                self.snapshot_queues[spec.name].put_nowait(row)
+            except asyncio.QueueFull:
+                log.warning(f"[{symbol}] {spec.name} queue full; dropping row.")
+
     def on_ws_frame(self, transport: WSTransport, frame: WSFrame) -> None:
         if frame.msg_type != WSMsgType.TEXT:
             return
+
+        local_us: int = time.time_ns() // 1000
 
         try:
             message: str = frame.get_payload_as_ascii_text()
@@ -293,7 +398,6 @@ class BinanceStreamListener(WSListener):
                     update["pu"] = update["pu"] - 1
 
             if not self.snapshot_received[symbol]:
-                # log.info(f"[{symbol}] No snapshot received yet.")
                 self.buffers[symbol].append(update)
                 if len(self.buffers[symbol]) > self.max_buffer_size:
                     self.buffers[symbol].popleft()
@@ -304,14 +408,17 @@ class BinanceStreamListener(WSListener):
                     )
                     self.snapshot_received[symbol] = False
                     self.buffers[symbol].clear()
+                    # Drop dedup state for every data type of this symbol so each
+                    # re-emits a fresh first row after resync.
+                    for dkey in [k for k in self.last_emitted if k[1] == symbol]:
+                        del self.last_emitted[dkey]
                     asyncio.create_task(self.delayed_snapshot_fetch(symbol))
                     return
 
                 self.order_books_collection.apply_diff(symbol, update["b"], update["a"])
                 self.prev_u[symbol] = update["u"]
 
-                best_bid, best_ask = self.order_books_collection.get_top_levels(symbol)
-                log.info(f"[{symbol}] Top Bid: {best_bid} | Top Ask: {best_ask}")
+                self.emit_snapshot(symbol, update["E"], local_us)
 
         except Exception as e:
             log.error(f"Error during frame processing: {e}")
@@ -322,7 +429,7 @@ class BinanceStreamListener(WSListener):
 
 @beartype
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Binance Order Book Depth Listener")
+    parser = argparse.ArgumentParser(description="Binance Tardis-style market-data collector")
     parser.add_argument(
         "--symbols",
         nargs="+",
@@ -331,11 +438,18 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--interval",
-        type=int,
-        choices=[1,2,3,4,5,6,10,12,15,20,30,60],
-        default=1,
-        help="Interval in minutes between metric calculations"
+        "--data-types",
+        nargs="+",
+        choices=list(DATA_TYPES),
+        default=["book_snapshot_5"],
+        help="Tardis data types to collect (one CSV file per type in --output-dir).",
+    )
+
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=".",
+        help="Directory for the output CSV files (one per data type, e.g. book_snapshot_5.csv).",
     )
 
     parser.add_argument(
@@ -344,26 +458,6 @@ def parse_args() -> argparse.Namespace:
         help="Enable simulation of desynchronization (for testing purposes)"
     )
 
-    parser.add_argument(
-        "--output-file",
-        type=str,
-        default="output.csv", # Default value if not provided
-        help="Path to the output CSV file for metrics (e.g., /path/to/your/output.csv)",
-    )
-
-    parser.add_argument(
-        "--kafka-brokers",
-        type=str,
-        default=None,
-        help="Comma-separated list of Kafka broker addresses (e.g., localhost:9092). If not provided, Kafka publishing is disabled.",
-    )
-    parser.add_argument(
-        "--kafka-topic",
-        type=str,
-        default="test-topic",
-        help="Kafka topic to which metrics will be published (default: test-topic)",
-    )
-    
     return parser.parse_args()
 
 
@@ -372,98 +466,48 @@ async def main(args: argparse.Namespace) -> None:
 
     symbols = [symbol.upper() for symbol in args.symbols]
     log.info(f"Selected symbols: {', '.join(symbols)}")
-    log.info(f"Metric calculation interval: {args.interval} minutes")
     if args.simulate_desync:
         log.warning("Desynchronization simulation is ENABLED.")
     simulate_desync = args.simulate_desync
 
-    output_filepath = args.output_file
-    log.info(f"Metrics will be saved to: {output_filepath}")
-
-    kafka_producer: Optional[AIOKafkaProducer] = None
-    if args.kafka_brokers:
-        log.info(f"Attempting to initialize Kafka producer for brokers: {args.kafka_brokers}")
-        try:
-            kafka_producer = AIOKafkaProducer(
-                bootstrap_servers=args.kafka_brokers,
-                value_serializer=lambda v: json.dumps(v).encode('utf-8'),
-                acks='all'
-            )
-            await kafka_producer.start()
-            log.info(f"Kafka producer started. Metrics will be sent to topic: {args.kafka_topic}")
-        except Exception as e:
-            log.error(f"Failed to initialize or start Kafka producer: {e}. Kafka publishing will be disabled.", exc_info=True)
-            kafka_producer = None
+    specs = [DATA_TYPES[name] for name in args.data_types]
+    os.makedirs(args.output_dir, exist_ok=True)
+    log.info(f"Collecting data types {[s.name for s in specs]} into: {args.output_dir}")
 
     order_book_collection = OrderBookCollection(symbols)
 
-    scheduler = Scheduler(interval_minutes=args.interval)
-    calculators: Dict[str, SecondLevelSpreadCalculator] = {}
-
-    for symbol in symbols:
-        calculator = SecondLevelSpreadCalculator(
-            symbol=symbol, order_book_collection=order_book_collection
-        )
-        calculators[symbol] = calculator
-
-        # Define an async callback for each symbol
-        async def metric_callback(timestamp: str, sym: str = symbol, filepath: str = output_filepath, 
-                                  producer: Optional[AIOKafkaProducer] = kafka_producer, 
-                                  topic: Optional[str] = args.kafka_topic if kafka_producer else None) -> None:
-            # Ensure we are using the correct calculator for this symbol
-            current_calculator = calculators[sym]
-            log.info(f"Scheduler: Calculating metrics for {sym} at {timestamp}")
-            spread = current_calculator.calc_metric()
-
-            metric_name = "second_level_spread_percentage"
-
-            if spread is not None:
-                log.info(f"[{sym}] {metric_name}: {spread:.4f}% at {timestamp}")
-
-                output_data = {
-                    "timestamp": timestamp,
-                    "instrument": sym,
-                    "metric": spread
-                }
-
-                try:
-                    # Async write to file
-                    async with aiofiles.open(filepath, mode="a", encoding="utf-8") as f:
-                        await f.write(json.dumps(output_data) + "\n")
-                    log.debug(f"[{sym}] Successfully wrote metric to {filepath}")
-                except Exception as e:
-                    log.error(f"[{sym}] Error writing metric to file {filepath}: {e}")
-
-
-                if producer and topic:
-                    try:
-                        log.debug(f"[{sym}] Sending to Kafka topic '{topic}': {output_data}")
-                        # The producer's value_serializer will handle converting output_data to bytes.
-                        await producer.send_and_wait(topic, value=output_data, key=sym.encode('utf-8'))
-                        log.info(f"[{sym}] Successfully sent metric to Kafka topic '{topic}'")
-                    except Exception as e:
-                        log.error(f"[{sym}] Error sending metric to Kafka topic '{topic}': {e}", exc_info=True)
-
-            else:
-                log.info(f"[{sym}] Could not calculate Second Level Spread at {timestamp}.")
-        
-        scheduler.subscribe(metric_callback)
-        log.info(f"Subscribed SecondLevelSpreadCalculator for {symbol} to scheduler.")
-
-    # Start the scheduler as a background task
-    asyncio.create_task(scheduler.start())
-    log.info("Scheduler task created and started.")
+    # One queue + one writer task per data type; each writes its own file/header.
+    snapshot_queues: Dict[str, "asyncio.Queue[str]"] = {
+        spec.name: asyncio.Queue() for spec in specs
+    }
+    for spec in specs:
+        path = os.path.join(args.output_dir, f"{spec.name}.csv")
+        asyncio.create_task(snapshot_writer(snapshot_queues[spec.name], path, spec.header))
 
     while True:
         try:
 
-            streams = "/".join(f"{symbol.lower()}@depth@100ms" for symbol in symbols)
+            streams = "/".join(f"{symbol.lower()}@depth@0ms" for symbol in symbols)
             binance_ws_url = f"wss://fstream.binance.com/stream?streams={streams}"
 
             log.info(f"Connecting to: {binance_ws_url}")
 
-            listener_factory = partial(BinanceStreamListener, symbols=symbols, order_book_collection=order_book_collection, simulate_desync_flag=simulate_desync)
-            transport, _ = await ws_connect(listener_factory, binance_ws_url)
+            # picows passes the negotiated WSUpgradeRequest/Response to the factory;
+            # accept and ignore them so they don't collide with __init__ params.
+            def listener_factory(*_args):
+                return BinanceStreamListener(
+                    symbols=symbols,
+                    order_book_collection=order_book_collection,
+                    snapshot_queues=snapshot_queues,
+                    data_type_specs=specs,
+                    simulate_desync_flag=simulate_desync,
+                )
+            # enable_auto_ping lets picows detect a silently-stalled connection
+            # (no data, no FIN): after ~10s idle it pings, and with no reply it
+            # disconnects, so wait_disconnected() returns and we reconnect+resync.
+            transport, _ = await ws_connect(
+                listener_factory, binance_ws_url, enable_auto_ping=True
+            )
             await transport.wait_disconnected()
         except Exception as e:
             log.error(f"Connection error: {e}. Retrying in 5 seconds...")

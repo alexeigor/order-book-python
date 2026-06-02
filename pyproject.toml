@@ -16,5 +16,4 @@ dependencies = [
     "pyinstrument",
     "pytest",
     "aiofiles",
-    "aiokafka",
 ]

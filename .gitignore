@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# Virtual environments (uv)
+.venv/
+venv/
+
+# Generated profiler report (written on every exit)
+profile_report.html
+
+# Collector output (Tardis-format CSVs)
+quotes.csv
+book_snapshot_5.csv
+book_snapshot_25.csv
+data/
+*.csv.gz
+
+# Local Claude Code state
+.claude/
+
+# OS
+.DS_Store
