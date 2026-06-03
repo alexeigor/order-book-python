@@ -24,10 +24,23 @@ logging.basicConfig(level=logging.DEBUG)
 log = logging.getLogger(__name__)
 
 
-# Identifier for Binance USD-M futures, matching Tardis' exchange id.
+# Tardis exchange id embedded in every emitted CSV row. Defaults to USD-M futures;
+# `main()` overrides it from the selected MarketSpec (e.g. "binance" for spot).
 EXCHANGE = "binance-futures"
 # Number of price levels per side captured in each book_snapshot_5 row.
 SNAPSHOT_DEPTH = 5
+
+# Max levels retained per side in the stored book. Binance's REST depth snapshot
+# seeds at most 1000 levels/side (fapi .../depth?limit=1000), but the @depth diff
+# stream also pushes changes to levels *deeper* than that. Those deep levels were
+# never seeded, so once added they are orphaned — they may never receive a qty=0
+# removal and would otherwise accumulate without bound (unbounded memory + a
+# stale, partial deep book). Per Binance's prescribed algorithm we cap each side
+# here, dropping the deepest levels. NOTE: this is the *snapshot-depth* boundary,
+# not the top-N display depth — trimming to the display depth (5/25) would lose
+# diffs to levels just outside the view and corrupt assembly (a prior bug); this
+# does not, since BOOK_DEPTH_LIMIT is far deeper than any emitted snapshot.
+BOOK_DEPTH_LIMIT = 1000
 
 # A single price level as the exchange's original (price, qty) decimal strings.
 Level = Tuple[str, str]
@@ -76,6 +89,17 @@ class OrderBook:
                 self.asks.pop(p, None)
             else:
                 self.asks[p] = (price, qty)
+
+        self._prune_orphans()
+
+    def _prune_orphans(self, limit: int = BOOK_DEPTH_LIMIT) -> None:
+        # Drop levels deeper than `limit` per side. popitem(index=-1) removes the
+        # last entry in sort order, which is the deepest level on each side:
+        # lowest-priced bid (bids sort highest-first) / highest-priced ask.
+        while len(self.bids) > limit:
+            self.bids.popitem(index=-1)
+        while len(self.asks) > limit:
+            self.asks.popitem(index=-1)
 
     def top_levels(self, depth: int = SNAPSHOT_DEPTH) -> Tuple[List[Level], List[Level]]:
         # islice keeps this O(depth) even when the full book holds thousands of levels.
@@ -140,6 +164,14 @@ PREAMBLE = ["exchange", "symbol", "timestamp", "local_timestamp"]
 # ask_amount, ask_price, bid_price, bid_amount.
 QUOTES_HEADER = ",".join(PREAMBLE + ["ask_amount", "ask_price", "bid_price", "bid_amount"])
 
+# Tardis `incremental_book_L2` schema: the raw L2 feed, one row per changed level.
+# Unlike the snapshot types this is NOT reconstructed/deduped — diffs and the
+# initial REST snapshot are emitted close to verbatim. `amount` is the absolute
+# new level size (not a delta); "0" means the level was removed. `is_snapshot`
+# is "true" for the full-book block emitted on (re)sync and "false" for diffs.
+INCREMENTAL_NAME = "incremental_book_L2"
+INCREMENTAL_BOOK_L2_HEADER = ",".join(PREAMBLE + ["is_snapshot", "side", "price", "amount"])
+
 
 @beartype
 def build_snapshot_header(depth: int) -> str:
@@ -194,9 +226,66 @@ def build_quotes_row(
 
 
 @beartype
+def build_incremental_rows(
+    symbol: str,
+    ts_us: int,
+    local_us: int,
+    bids: List[List[str]],
+    asks: List[List[str]],
+    is_snapshot: bool,
+) -> List[str]:
+    """Build Tardis-format `incremental_book_L2` lines — one row per changed level.
+
+    `bids`/`asks` are the exchange's raw `[price, qty]` pairs (from a diff or the
+    REST snapshot); `qty` is kept verbatim, so a "0" amount (level removal) passes
+    through unchanged. Asks are emitted before bids; rows from one event share a
+    timestamp, matching Tardis' group-by-local_timestamp convention.
+    """
+    flag = "true" if is_snapshot else "false"
+    preamble = [EXCHANGE, symbol.lower(), str(ts_us), str(local_us), flag]
+    rows: List[str] = []
+    for side, levels in (("ask", asks), ("bid", bids)):
+        for price, qty in levels:
+            rows.append(",".join(preamble + [side, price, qty]))
+    return rows
+
+
+@beartype
 def dedup_key(asks: List[Level], bids: List[Level]) -> Tuple:
     """Hashable key for change-detection: the tracked levels of both sides."""
     return (tuple(asks), tuple(bids))
+
+
+# --- Binance order-book sync rules (spot vs. futures differ) -----------------
+# Spot and USD-M futures both follow Binance's "manage a local order book"
+# procedure, but three comparisons differ. These are pure so they can be unit
+# tested directly (the logic was previously inline in the listener):
+#   - discard rule:   futures `u <  lastUpdateId`   | spot `u <= lastUpdateId`
+#   - first straddle: futures `U <= id <= u`         | spot `U <= id+1 <= u`
+#   - continuity:     futures `pu == prev_u`         | spot `U == prev_u + 1`
+# (Spot diff events carry no `pu` field, hence the U-based continuity check.)
+
+@beartype
+def should_discard(u: int, last_update_id: int, is_spot: bool) -> bool:
+    """True if a buffered event is stale relative to the snapshot and should be skipped."""
+    return u <= last_update_id if is_spot else u < last_update_id
+
+
+@beartype
+def straddles(U: int, u: int, last_update_id: int, is_spot: bool) -> bool:
+    """True if this event bridges the snapshot to the stream (the first to apply)."""
+    pivot = last_update_id + 1 if is_spot else last_update_id
+    return U <= pivot <= u
+
+
+@beartype
+def is_continuous(update: Dict[str, Any], prev_u: Optional[int], is_spot: bool) -> bool:
+    """True if `update` follows the previous applied event with no gap."""
+    if prev_u is None:
+        return False
+    if is_spot:
+        return update["U"] == prev_u + 1
+    return update["pu"] == prev_u
 
 
 class DataTypeSpec(NamedTuple):
@@ -215,6 +304,55 @@ DATA_TYPES: Dict[str, DataTypeSpec] = {
     ),
     "book_snapshot_25": DataTypeSpec(
         "book_snapshot_25", 25, build_snapshot_header(25), partial(build_snapshot_row, depth=25)
+    ),
+}
+
+# `incremental_book_L2` is selectable too, but it does not fit the snapshot
+# `DataTypeSpec` (it emits many raw rows per event, not one top-N row), so it
+# lives outside DATA_TYPES and gets its own emission path in the listener.
+ALL_DATA_TYPE_NAMES: List[str] = list(DATA_TYPES) + [INCREMENTAL_NAME]
+
+
+@beartype
+def header_for(name: str) -> str:
+    """CSV header for any selectable data type (snapshot registry or incremental)."""
+    if name == INCREMENTAL_NAME:
+        return INCREMENTAL_BOOK_L2_HEADER
+    return DATA_TYPES[name].header
+
+
+class MarketSpec(NamedTuple):
+    """Everything that differs between Binance markets (spot vs. USD-M futures)."""
+    name: str            # CLI value: "futures" | "spot"
+    exchange_id: str     # Tardis exchange id embedded in CSV rows
+    rest_depth_url: str  # REST depth endpoint (formatted with symbol + limit)
+    ws_base: str         # combined-stream websocket base URL
+    stream_suffix: str   # per-symbol diff-stream suffix appended to the symbol
+    snapshot_limit: int  # REST snapshot depth (kept <= BOOK_DEPTH_LIMIT)
+    is_spot: bool        # selects the spot sync-rule variant
+
+
+# NOTE: spot has NO 0ms diff stream — only 100ms / 1000ms. Binance silently
+# accepts a `@depth@0ms` spot subscription but never delivers data, so spot must
+# use `@depth@100ms` (verified live). Futures uses the real-time `@depth@0ms`.
+MARKETS: Dict[str, MarketSpec] = {
+    "futures": MarketSpec(
+        name="futures",
+        exchange_id="binance-futures",
+        rest_depth_url="https://fapi.binance.com/fapi/v1/depth",
+        ws_base="wss://fstream.binance.com/stream",
+        stream_suffix="@depth@0ms",
+        snapshot_limit=1000,
+        is_spot=False,
+    ),
+    "spot": MarketSpec(
+        name="spot",
+        exchange_id="binance",
+        rest_depth_url="https://api.binance.com/api/v3/depth",
+        ws_base="wss://stream.binance.com:9443/stream",
+        stream_suffix="@depth@100ms",
+        snapshot_limit=1000,
+        is_spot=True,
     ),
 }
 
@@ -248,15 +386,20 @@ class BinanceStreamListener(WSListener):
         order_book_collection: OrderBookCollection,
         snapshot_queues: Dict[str, asyncio.Queue],
         data_type_specs: List[DataTypeSpec],
+        market: MarketSpec,
+        emit_incremental: bool = False,
         simulate_desync_flag: bool = False,
     ) -> None:
         super().__init__()
         self.symbols: List[str] = [s.upper() for s in symbols]
+        self.spec = market
         self.order_books_collection = order_book_collection
         self.snapshot_queues = snapshot_queues
         self.data_type_specs = data_type_specs
-        # Extract the book once at the deepest configured depth; each type slices a prefix.
-        self.max_depth: int = max(spec.depth for spec in data_type_specs)
+        self.emit_incremental = emit_incremental
+        # Extract the book once at the deepest configured depth; each type slices a
+        # prefix. `default=1` covers selecting only incremental_book_L2 (no snapshot specs).
+        self.max_depth: int = max((spec.depth for spec in data_type_specs), default=1)
         self.buffers: Dict[str, Deque[Dict[str, Any]]] = defaultdict(deque)
         self.snapshot_received: Dict[str, bool] = {
             symbol: False for symbol in self.symbols
@@ -278,7 +421,7 @@ class BinanceStreamListener(WSListener):
         self.snapshot_fetching[symbol_upper] = True
 
         url: str = (
-            f"https://fapi.binance.com/fapi/v1/depth?symbol={symbol_upper}&limit=1000"
+            f"{self.spec.rest_depth_url}?symbol={symbol_upper}&limit={self.spec.snapshot_limit}"
         )
 
         try:
@@ -288,6 +431,17 @@ class BinanceStreamListener(WSListener):
                     self.order_books_collection.update_snapshot(symbol_upper, data)
                     log.info(
                         f"[{symbol_upper}] Snapshot retrieved. lastUpdateId = {self.order_books_collection.get_last_update_id(symbol_upper)}"
+                    )
+                    # Emit the full-book snapshot block (is_snapshot=true) before the
+                    # ~3s catch-up so it precedes the deltas in the L2 file. A consumer
+                    # discards prior state on this block (also true on resync).
+                    self.emit_incremental_rows(
+                        symbol_upper,
+                        data.get("E"),
+                        time.time_ns() // 1000,
+                        data.get("bids", []),
+                        data.get("asks", []),
+                        is_snapshot=True,
                     )
                     await asyncio.sleep(3.0)
                     self.apply_buffered_events(symbol_upper)
@@ -301,19 +455,27 @@ class BinanceStreamListener(WSListener):
         buffer = self.buffers[symbol_upper]
         new_buffer: Deque[Dict[str, Any]] = deque()
 
+        # last_update_id is set by the snapshot and not changed by apply_diff, so
+        # it is constant across this catch-up loop — read it once.
+        last_id = self.order_books_collection.get_last_update_id(symbol_upper)
+        is_spot = self.spec.is_spot
+
         for update in buffer:
             u = update["u"]
             U = update["U"]
 
-            if u < self.order_books_collection.get_last_update_id(symbol_upper):
+            if should_discard(u, last_id, is_spot):
                 continue
-            if U <= self.order_books_collection.get_last_update_id(symbol_upper) <= u:
+            if straddles(U, u, last_id, is_spot):
                 log.info(f"[{symbol_upper}] Applying buffered events...")
                 self.order_books_collection.apply_diff(symbol_upper, update["b"], update["a"])
                 self.prev_u[symbol_upper] = u
                 self.snapshot_received[symbol_upper] = True
+                self.emit_incremental_rows(
+                    symbol_upper, update["E"], update["local_us"], update["b"], update["a"], False
+                )
             elif self.snapshot_received[symbol_upper]:
-                if update["pu"] != self.prev_u[symbol_upper]:
+                if not is_continuous(update, self.prev_u[symbol_upper], is_spot):
                     log.warning(
                         f"[{symbol_upper}] Out of sync! Restarting snapshot process..."
                     )
@@ -323,6 +485,9 @@ class BinanceStreamListener(WSListener):
                     return
                 self.order_books_collection.apply_diff(symbol_upper, update["b"], update["a"])
                 self.prev_u[symbol_upper] = u
+                self.emit_incremental_rows(
+                    symbol_upper, update["E"], update["local_us"], update["b"], update["a"], False
+                )
 
         log.info(f"[{symbol_upper}] All buffered events applied.")
         self.buffers[symbol_upper] = new_buffer
@@ -343,8 +508,32 @@ class BinanceStreamListener(WSListener):
         await asyncio.sleep(delay)
         await self.fetch_snapshot(symbol)
 
+    def emit_incremental_rows(
+        self,
+        symbol: str,
+        event_time_ms: Optional[int],
+        local_us: int,
+        bids: List[List[str]],
+        asks: List[List[str]],
+        is_snapshot: bool,
+    ) -> None:
+        """Emit raw incremental_book_L2 rows (the snapshot block or a diff)."""
+        if not self.emit_incremental:
+            return
+        # Tardis falls back timestamp -> local_timestamp when no exchange time exists.
+        ts_us = event_time_ms * 1000 if event_time_ms else local_us
+        rows = build_incremental_rows(symbol, ts_us, local_us, bids, asks, is_snapshot)
+        queue = self.snapshot_queues[INCREMENTAL_NAME]
+        for row in rows:
+            try:
+                queue.put_nowait(row)
+            except asyncio.QueueFull:
+                log.warning(f"[{symbol}] {INCREMENTAL_NAME} queue full; dropping row.")
+
     def emit_snapshot(self, symbol: str, event_time_ms: int, local_us: int) -> None:
         """Emit a row for each configured data type, but only when its levels change."""
+        if not self.data_type_specs:
+            return
         top = self.order_books_collection.get_top_levels(symbol, self.max_depth)
         if top is None:
             return
@@ -385,24 +574,34 @@ class BinanceStreamListener(WSListener):
                 "s": symbol,
                 "U": data["U"],
                 "u": data["u"],
-                "pu": data["pu"],
+                # `pu` (previous final update id) exists on futures only; spot
+                # diff events omit it and use a U-based continuity check instead.
+                "pu": data.get("pu"),
                 "b": data.get("b", []),
                 "a": data.get("a", []),
+                # Receive time, retained so buffered events emit a faithful
+                # local_timestamp once they're applied after the snapshot.
+                "local_us": local_us,
             }
 
             simulate_desync = False
             if self.simulate_desync_flag and self.snapshot_received[symbol]:
                 simulate_desync = random.random() < 0.01
                 if simulate_desync:
-                    log.warning(f"[{symbol}] *** Simulating desync (pu != prev_u) ***")
-                    update["pu"] = update["pu"] - 1
+                    log.warning(f"[{symbol}] *** Simulating desync (continuity break) ***")
+                    # Break the market's continuity invariant: spot checks
+                    # U == prev_u+1 (bump U), futures checks pu == prev_u (bump pu).
+                    if self.spec.is_spot:
+                        update["U"] = update["U"] + 1
+                    else:
+                        update["pu"] = update["pu"] - 1
 
             if not self.snapshot_received[symbol]:
                 self.buffers[symbol].append(update)
                 if len(self.buffers[symbol]) > self.max_buffer_size:
                     self.buffers[symbol].popleft()
             else:
-                if update["pu"] != self.prev_u.get(symbol):
+                if not is_continuous(update, self.prev_u.get(symbol), self.spec.is_spot):
                     log.warning(
                         f"[{symbol}] Desync detected. Restarting from snapshot."
                     )
@@ -419,6 +618,9 @@ class BinanceStreamListener(WSListener):
                 self.prev_u[symbol] = update["u"]
 
                 self.emit_snapshot(symbol, update["E"], local_us)
+                self.emit_incremental_rows(
+                    symbol, update["E"], local_us, update["b"], update["a"], False
+                )
 
         except Exception as e:
             log.error(f"Error during frame processing: {e}")
@@ -438,9 +640,17 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--market",
+        choices=list(MARKETS),
+        default="futures",
+        help="Binance market to collect from (default: futures). Spot uses @depth@100ms "
+        "(no 0ms) and the spot sync rules; exchange id is 'binance' vs 'binance-futures'.",
+    )
+
+    parser.add_argument(
         "--data-types",
         nargs="+",
-        choices=list(DATA_TYPES),
+        choices=ALL_DATA_TYPE_NAMES,
         default=["book_snapshot_5"],
         help="Tardis data types to collect (one CSV file per type in --output-dir).",
     )
@@ -464,31 +674,42 @@ def parse_args() -> argparse.Namespace:
 @beartype
 async def main(args: argparse.Namespace) -> None:
 
+    spec = MARKETS[args.market]
+    # Builders read the module-level EXCHANGE at call time; set it from the
+    # selected market so every emitted row carries the right Tardis exchange id.
+    global EXCHANGE
+    EXCHANGE = spec.exchange_id
+
     symbols = [symbol.upper() for symbol in args.symbols]
+    log.info(f"Market: {spec.name} (exchange id '{spec.exchange_id}')")
     log.info(f"Selected symbols: {', '.join(symbols)}")
     if args.simulate_desync:
         log.warning("Desynchronization simulation is ENABLED.")
     simulate_desync = args.simulate_desync
 
-    specs = [DATA_TYPES[name] for name in args.data_types]
+    selected = args.data_types
+    # Snapshot-style types flow through emit_snapshot; incremental_book_L2 has
+    # its own raw-feed emission path (see BinanceStreamListener.emit_incremental_rows).
+    specs = [DATA_TYPES[name] for name in selected if name != INCREMENTAL_NAME]
+    emit_incremental = INCREMENTAL_NAME in selected
     os.makedirs(args.output_dir, exist_ok=True)
-    log.info(f"Collecting data types {[s.name for s in specs]} into: {args.output_dir}")
+    log.info(f"Collecting data types {selected} into: {args.output_dir}")
 
     order_book_collection = OrderBookCollection(symbols)
 
-    # One queue + one writer task per data type; each writes its own file/header.
+    # One queue + one writer task per selected data type; each writes its own file/header.
     snapshot_queues: Dict[str, "asyncio.Queue[str]"] = {
-        spec.name: asyncio.Queue() for spec in specs
+        name: asyncio.Queue() for name in selected
     }
-    for spec in specs:
-        path = os.path.join(args.output_dir, f"{spec.name}.csv")
-        asyncio.create_task(snapshot_writer(snapshot_queues[spec.name], path, spec.header))
+    for name in selected:
+        path = os.path.join(args.output_dir, f"{name}.csv")
+        asyncio.create_task(snapshot_writer(snapshot_queues[name], path, header_for(name)))
 
     while True:
         try:
 
-            streams = "/".join(f"{symbol.lower()}@depth@0ms" for symbol in symbols)
-            binance_ws_url = f"wss://fstream.binance.com/stream?streams={streams}"
+            streams = "/".join(f"{symbol.lower()}{spec.stream_suffix}" for symbol in symbols)
+            binance_ws_url = f"{spec.ws_base}?streams={streams}"
 
             log.info(f"Connecting to: {binance_ws_url}")
 
@@ -500,6 +721,8 @@ async def main(args: argparse.Namespace) -> None:
                     order_book_collection=order_book_collection,
                     snapshot_queues=snapshot_queues,
                     data_type_specs=specs,
+                    market=spec,
+                    emit_incremental=emit_incremental,
                     simulate_desync_flag=simulate_desync,
                 )
             # enable_auto_ping lets picows detect a silently-stalled connection
